@@ -1,0 +1,8 @@
+*.pth
+*.pkl
+*.pth.tar
+
+# 忽略虚拟环境或临时文件
+__pycache__/
+.vscode/
+.idea/
