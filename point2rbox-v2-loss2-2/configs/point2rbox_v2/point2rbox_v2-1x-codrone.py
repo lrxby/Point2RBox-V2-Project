@@ -78,7 +78,7 @@ model = dict(
             type='Point2RBoxV2ConsistencyLoss', loss_weight=1.0),
         loss_perspective=dict(
             type='PerspectiveAwareSizeConsistencyLoss', 
-            loss_weight=0.8,
+            loss_weight=0.1,
             beta=1.0,
             norm_type='image-norm')),
     # training and testing settings
