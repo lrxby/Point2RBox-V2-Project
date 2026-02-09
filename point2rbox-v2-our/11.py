@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import mmcv
 import cv2
-import tempfile  # 新增：用于临时文件中转
+import tempfile
 from tqdm import tqdm
 from mmengine import Config
 
@@ -16,6 +16,21 @@ except ImportError:
 
 from mmrotate.registry import VISUALIZERS
 from mmrotate.utils import register_all_modules
+
+# ========== 自定义调色板（至少15种颜色，对应DOTA 15个类别） ==========
+def get_dota_palette(num_classes):
+    """生成足够长度的DOTA数据集调色板"""
+    # 基础颜色（15种，覆盖DOTA所有类别）
+    base_palette = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255),
+        (0, 255, 255), (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0),
+        (128, 0, 128), (0, 128, 128), (64, 0, 0), (0, 64, 0), (0, 0, 64)
+    ]
+    # 如果类别数超过15，循环扩展调色板
+    palette = []
+    for i in range(num_classes):
+        palette.append(base_palette[i % len(base_palette)])
+    return palette
 
 def verify_model_predictions_advanced(config_path, checkpoint_path, img_dir, out_dir, score_thr=0.05):
     """
@@ -33,29 +48,54 @@ def verify_model_predictions_advanced(config_path, checkpoint_path, img_dir, out
         print(f"模型加载失败: {e}")
         return
 
-    # ========== 可视化器初始化 ==========
-    if hasattr(model.cfg, 'visualizer'):
-        visualizer_cfg = model.cfg.visualizer.copy()
-        if 'vis_backends' in visualizer_cfg:
-            for backend_cfg in visualizer_cfg['vis_backends']:
-                if backend_cfg['type'] == 'LocalVisBackend':
-                    backend_cfg['save_dir'] = out_dir
-        visualizer = VISUALIZERS.build(visualizer_cfg)
-    else:
-        from mmrotate.visualization import RotLocalVisualizer
-        visualizer = RotLocalVisualizer(
-            name='visualizer',
-            vis_backends=[{'type': 'LocalVisBackend', 'save_dir': out_dir}],
-            line_width=2
-        )
-    
-    visualizer.dataset_meta = model.dataset_meta
-    if 'classes' not in visualizer.dataset_meta:
-        print("警告：未找到类别名称配置，将使用默认类别名 class_0, class_1...")
+    # ========== 核心：DOTA固定15类，避免配置路径错误 ==========
+    num_classes = 15
+    # DOTA官方类别列表
+    dota_classes = (
+        'plane', 'baseball-diamond', 'bridge', 'ground-track-field',
+        'small-vehicle', 'large-vehicle', 'ship', 'tennis-court',
+        'basketball-court', 'storage-tank', 'soccer-ball-field', 'roundabout',
+        'harbor', 'swimming-pool', 'helicopter'
+    )
+    class_names = dota_classes
+
+    # 可选：尝试从配置文件自动读取（备用方案）
+    try:
         cfg = Config.fromfile(config_path)
-        num_classes = cfg.model.head.num_classes
-        visualizer.dataset_meta['classes'] = [f'class_{i}' for i in range(num_classes)]
-    class_names = visualizer.dataset_meta['classes']
+        # 尝试常见的类别数配置路径
+        if hasattr(cfg.model, 'bbox_head'):
+            auto_num_classes = cfg.model.bbox_head.num_classes
+        elif hasattr(cfg.model, 'head'):
+            auto_num_classes = cfg.model.head.num_classes
+        elif hasattr(cfg.model, 'roi_head'):
+            auto_num_classes = cfg.model.roi_head.bbox_head.num_classes
+        else:
+            auto_num_classes = num_classes
+        
+        if auto_num_classes != num_classes:
+            print(f"警告：配置文件中类别数({auto_num_classes})与DOTA标准类别数(15)不一致！")
+            print(f"将使用DOTA标准15类进行可视化")
+    except Exception as e:
+        print(f"从配置文件读取类别数失败: {e}，使用DOTA标准15类")
+
+    # ========== 核心修复：可视化器初始化（移除顶层palette参数） ==========
+    visualizer_cfg = dict(
+        type='RotLocalVisualizer',
+        name='visualizer',
+        vis_backends=[{'type': 'LocalVisBackend', 'save_dir': out_dir}],
+        line_width=2,
+        # 关键修复：移除顶层palette，仅在dataset_meta中指定
+        dataset_meta=dict(
+            classes=class_names,
+            palette=get_dota_palette(num_classes)  # palette仅放在dataset_meta中
+        )
+    )
+    visualizer = VISUALIZERS.build(visualizer_cfg)
+    # 强制覆盖model的dataset_meta（确保类别和调色板一致）
+    visualizer.dataset_meta = {
+        'classes': class_names,
+        'palette': get_dota_palette(num_classes)
+    }
 
     # 获取图片
     extensions = ['*.png', '*.jpg', '*.jpeg', '*.bmp']
@@ -111,13 +151,13 @@ def verify_model_predictions_advanced(config_path, checkpoint_path, img_dir, out
             ratios = np.maximum(safe_ws / safe_hs, safe_hs / safe_ws)
             stats['ratios'].extend(ratios.tolist())
 
-        # ========== 核心修复：框和标签同时显示 ==========
+        # ========== 框和标签同时显示逻辑 ==========
         try:
-            # 1. 创建临时文件，让可视化器先保存带框的图片
+            # 1. 创建临时文件
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
                 tmp_path = tmp_file.name
             
-            # 2. 可视化器绘制检测框并保存到临时文件
+            # 2. 可视化器绘制检测框
             img = mmcv.imread(img_path)
             visualizer.add_datasample(
                 name=img_name,
@@ -126,15 +166,15 @@ def verify_model_predictions_advanced(config_path, checkpoint_path, img_dir, out
                 draw_gt=False,
                 draw_pred=True,
                 show=False,
-                out_file=tmp_path,  # 保存到临时文件
+                out_file=tmp_path,
                 pred_score_thr=score_thr
             )
             
-            # 3. 用OpenCV读取带框的临时图片
+            # 3. 读取带框图片并删除临时文件
             img_with_boxes = cv2.imread(tmp_path)
-            os.remove(tmp_path)  # 删除临时文件
+            os.remove(tmp_path)
             
-            # 4. 提取需要标注的框、分数、类别
+            # 4. 提取标注信息
             pred_instances = result.pred_instances
             mask = pred_instances.scores > score_thr
             if mask.sum() == 0:
@@ -145,13 +185,14 @@ def verify_model_predictions_advanced(config_path, checkpoint_path, img_dir, out
             valid_scores = pred_instances.scores[mask].detach().cpu().numpy()
             valid_labels = pred_instances.labels[mask].detach().cpu().numpy()
             
-            # 5. 叠加标签到带框的图片上
+            # 5. 叠加标签到图片
             for bbox, score, label in zip(valid_bboxes, valid_scores, valid_labels):
                 cx, cy, w, h, theta = bbox
                 x_offset = -w/2 * np.cos(theta) - h/2 * np.sin(theta)
                 y_offset = -w/2 * np.sin(theta) + h/2 * np.cos(theta)
                 label_x = int(cx + x_offset)
                 label_y = int(cy + y_offset)
+                # 防止标签超出图片边界
                 label_x = max(10, min(label_x, img_with_boxes.shape[1]-100))
                 label_y = max(20, min(label_y, img_with_boxes.shape[0]-20))
                 label_text = f"{class_names[label]} {score:.2f}"
@@ -175,7 +216,7 @@ def verify_model_predictions_advanced(config_path, checkpoint_path, img_dir, out
                     1
                 )
             
-            # 6. 保存最终带框和标签的图片
+            # 6. 保存最终图片
             cv2.imwrite(os.path.join(out_dir, img_name), img_with_boxes)
             
         except Exception as e:
@@ -237,10 +278,14 @@ def verify_model_predictions_advanced(config_path, checkpoint_path, img_dir, out
 if __name__ == '__main__':
     # ================= 配置区域 =================
     config_file = '/mnt/data/liurunxiang/workplace/point2rbox-v2-our/configs/point2rbox_v2/point2rbox_v2-1x-dota.py' 
-    checkpoint_file = 'work_dirs/dt/2/e2e/epoch_9.pth'
+    checkpoint_file = 'work_dirs/dt/1/e2e/epoch_1.pth'
     image_dir = '/mnt/data/xiekaikai/split_ss_dota/trainval/images'
-    output_dir = '/mnt/data/liurunxiang/workplace/point2rbox-v2-our/work_dirs/dt/2/visual3'
+    output_dir = '/mnt/data/liurunxiang/workplace/point2rbox-v2-our/work_dirs/dt/1/visual1'
     score_threshold = 0.5
     # ===========================================
+
+    # 屏蔽torch.meshgrid无关警告
+    import warnings
+    warnings.filterwarnings("ignore", message="torch.meshgrid: in an upcoming release")
 
     verify_model_predictions_advanced(config_file, checkpoint_file, image_dir, output_dir, score_threshold)
